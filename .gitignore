@@ -1,0 +1,22 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Binaries distributed via GitHub Releases, not in the repo
+ScannerCanoScan.exe
+zadig.exe
+
+# Python
+__pycache__/
+*.pyc
+
+# Scan output
+Scans/
+Scansioni/
+
+# Local tooling
+.claude/
+
+# Local scratch
+*.tmp
