@@ -15,6 +15,11 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, ttk
 
+from PIL import Image, ImageChops, ImageTk
+
+APP_NAME = "ScannerCanoScan"
+APP_VERSION = "1.1.0"
+
 if getattr(sys, "frozen", False):
     BUNDLE_DIR = sys._MEIPASS            # resources extracted by PyInstaller
     APP_DIR = os.path.dirname(sys.executable)
@@ -29,8 +34,12 @@ SCAN_DIR = os.path.join(APP_DIR, "Scans")
 MODES = {"Color": "Color", "Grayscale": "Gray", "Black & white": "Lineart"}
 DPI_VALUES = ["75", "150", "300", "600"]
 FORMATS = ["PNG", "JPEG", "PDF", "TIFF"]
-# full flatbed area in mm (backend default is only 103x76mm)
-FULL_AREA = ["-l", "0", "-t", "0", "-x", "215", "-y", "297"]
+
+# Full flatbed area in mm (the backend default is only 103x76mm).
+BED_W_MM = 215.0
+BED_H_MM = 297.0
+# Anything smaller than this is treated as a stray click, not a selection.
+MIN_SEL_MM = 5.0
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -41,22 +50,123 @@ def to_cygpath(path):
     return "/cygdrive/" + drive[0].lower() + rest.replace("\\", "/")
 
 
+def scanimage_cmd():
+    """The scanimage command line. SCANNERCANOSCAN_SCANIMAGE overrides it
+    (used by tools/mock_scanimage.py to develop without the hardware)."""
+    override = os.environ.get("SCANNERCANOSCAN_SCANIMAGE")
+    if not override:
+        return [SCANIMAGE]
+    if override.lower().endswith(".py"):
+        if getattr(sys, "frozen", False):
+            # sys.executable is this app, not a Python interpreter.
+            raise RuntimeError(
+                "SCANNERCANOSCAN_SCANIMAGE must point to an .exe in the packaged build; "
+                "the .py mock only works when running from source."
+            )
+        return [sys.executable, override]
+    return [override]
+
+
 def run_scanimage(args, timeout=900):
+    cwd = SANE_BIN if os.path.isdir(SANE_BIN) else APP_DIR
     p = subprocess.run(
-        [SCANIMAGE] + args, capture_output=True, timeout=timeout,
-        cwd=SANE_BIN, creationflags=CREATE_NO_WINDOW,
+        scanimage_cmd() + args, capture_output=True, timeout=timeout,
+        cwd=cwd, creationflags=CREATE_NO_WINDOW,
     )
     return p.returncode, p.stdout, p.stderr
+
+
+# ---------------- Geometry (pure functions, unit-testable without Tk) ----------------
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def area_args(sel_mm=None):
+    """SANE geometry: -l/-t = top-left corner, -x/-y = width/height, in mm."""
+    left, top, width, height = sel_mm if sel_mm else (0.0, 0.0, BED_W_MM, BED_H_MM)
+    return ["-l", f"{left:.1f}", "-t", f"{top:.1f}",
+            "-x", f"{width:.1f}", "-y", f"{height:.1f}"]
+
+
+def canvas_to_mm(cx, cy, disp):
+    """Canvas pixel -> flatbed mm. disp = (x0, y0, w, h) of the preview on canvas."""
+    x0, y0, w, h = disp
+    fx = clamp((cx - x0) / w, 0.0, 1.0)
+    fy = clamp((cy - y0) / h, 0.0, 1.0)
+    return fx * BED_W_MM, fy * BED_H_MM
+
+
+def mm_to_canvas(mx, my, disp):
+    x0, y0, w, h = disp
+    return x0 + (mx / BED_W_MM) * w, y0 + (my / BED_H_MM) * h
+
+
+def rect_to_sel_mm(p0, p1, disp):
+    """Two canvas points -> (left, top, width, height) in mm, None if too small."""
+    ax, ay = canvas_to_mm(p0[0], p0[1], disp)
+    bx, by = canvas_to_mm(p1[0], p1[1], disp)
+    left, top = min(ax, bx), min(ay, by)
+    width, height = abs(bx - ax), abs(by - ay)
+    if width < MIN_SEL_MM or height < MIN_SEL_MM:
+        return None
+    return left, top, width, height
+
+
+def _border_level(gray, band=4):
+    """Median grey level of the image border = the empty flatbed background."""
+    w, h = gray.size
+    band = max(1, min(band, w, h))
+    px = []
+    px += list(gray.crop((0, 0, w, band)).getdata())
+    px += list(gray.crop((0, h - band, w, h)).getdata())
+    px += list(gray.crop((0, 0, band, h)).getdata())
+    px += list(gray.crop((w - band, 0, w, h)).getdata())
+    px.sort()
+    return px[len(px) // 2]
+
+
+def autocrop_sel_mm(img, tolerance=18, margin_mm=1.0):
+    """Bounding box of the document on a full-bed preview -> (l, t, w, h) in mm.
+
+    The background level is measured on the image border, so it works both with
+    the lid closed (white) and open (dark)."""
+    gray = img.convert("L")
+    bg = _border_level(gray)
+    diff = ImageChops.difference(gray, Image.new("L", gray.size, bg))
+    box = diff.point(lambda p: 255 if p > tolerance else 0).getbbox()
+    if not box:
+        return None
+    iw, ih = gray.size
+    left = clamp(box[0] / iw * BED_W_MM - margin_mm, 0.0, BED_W_MM)
+    top = clamp(box[1] / ih * BED_H_MM - margin_mm, 0.0, BED_H_MM)
+    right = clamp(box[2] / iw * BED_W_MM + margin_mm, 0.0, BED_W_MM)
+    bottom = clamp(box[3] / ih * BED_H_MM + margin_mm, 0.0, BED_H_MM)
+    if right - left < MIN_SEL_MM or bottom - top < MIN_SEL_MM:
+        return None
+    return left, top, right - left, bottom - top
+
+
+def describe_sel(sel_mm):
+    if not sel_mm:
+        return f"Scan area: full bed ({BED_W_MM:.0f} x {BED_H_MM:.0f} mm)"
+    left, top, width, height = sel_mm
+    return (f"Scan area: {width:.0f} x {height:.0f} mm "
+            f"(offset {left:.0f}, {top:.0f} mm)")
 
 
 class ScannerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ScannerCanoScan — SANE LM983x scanner")
+        self.title(f"{APP_NAME} {APP_VERSION} — SANE LM983x scanner")
         self.geometry("980x640")
         self.minsize(760, 480)
-        self.preview_img = None
         self.busy = False
+        self.preview_img = None      # PIL image of the last full-bed preview
+        self.tk_img = None           # keep a reference or Tk garbage-collects it
+        self.disp = None             # (x0, y0, w, h) of the preview on the canvas
+        self.sel_mm = None           # selected area in mm, None = full bed
+        self._drag_from = None
         self._build_ui()
         self.after(200, lambda: self._start_bg(self.check_scanner))
 
@@ -91,17 +201,39 @@ class ScannerApp(tk.Tk):
         self.btn_preview.pack(fill="x", pady=2)
         self.btn_scan = ttk.Button(left, text="SCAN", command=self.do_scan)
         self.btn_scan.pack(fill="x", pady=2)
+
+        ttk.Separator(left).pack(fill="x", pady=(14, 8))
+        ttk.Label(left, text="Scan area", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.area_var = tk.StringVar(value=describe_sel(None))
+        ttk.Label(left, textvariable=self.area_var, wraplength=170,
+                  foreground="#333333").pack(anchor="w", pady=(2, 6))
+        ttk.Label(left, text="Drag on the preview to select an area.",
+                  wraplength=170, foreground="#777777").pack(anchor="w", pady=(0, 6))
+        self.btn_autocrop = ttk.Button(left, text="Auto-crop", command=self.do_autocrop)
+        self.btn_autocrop.pack(fill="x", pady=2)
+        ttk.Button(left, text="Reset to full area", command=self.clear_selection).pack(
+            fill="x", pady=2
+        )
+
+        ttk.Separator(left).pack(fill="x", pady=(14, 8))
         ttk.Button(left, text="Open Scans folder", command=self.open_folder).pack(
-            fill="x", pady=(16, 2)
+            fill="x", pady=2
         )
         ttk.Button(left, text="Check scanner", command=lambda: self._start_bg(self.check_scanner)).pack(
             fill="x", pady=2
         )
+        ttk.Label(left, text=f"v{APP_VERSION}", foreground="#999999").pack(
+            anchor="w", pady=(16, 0)
+        )
 
         right = ttk.Frame(self, padding=8)
         right.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(right, bg="#2b2b2b", highlightthickness=0)
+        self.canvas = tk.Canvas(right, bg="#2b2b2b", highlightthickness=0, cursor="cross")
         self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Configure>", lambda e: self._render())
 
         self.status_var = tk.StringVar(value="Starting…")
         bar = ttk.Frame(self)
@@ -147,8 +279,8 @@ class ScannerApp(tk.Tk):
         )
         return False
 
-    def _scan_to_file(self, dpi, mode, fmt, win_path, timeout=900):
-        args = ["--mode", mode, "--resolution", str(dpi)] + FULL_AREA + [
+    def _scan_to_file(self, dpi, mode, fmt, win_path, sel_mm=None, timeout=900):
+        args = ["--mode", mode, "--resolution", str(dpi)] + area_args(sel_mm) + [
             f"--format={fmt}", "-o", to_cygpath(win_path)
         ]
         rc, out, err = run_scanimage(args, timeout=timeout)
@@ -162,11 +294,14 @@ class ScannerApp(tk.Tk):
         self._start_bg(self._preview_job)
 
     def _preview_job(self):
+        # The preview is always the full bed: that is what you select an area on.
         self.set_status("Preview in progress…", spinning=True)
         tmp = os.path.join(os.environ.get("TEMP", APP_DIR), "canoscan_preview.png")
         self._scan_to_file(75, "Color", "png", tmp)
-        self.set_status("Preview done ✔")
-        self.after(0, lambda: self._show_image(tmp))
+        img = Image.open(tmp)
+        img.load()
+        self.set_status("Preview done ✔ — drag on the image to select an area")
+        self.after(0, lambda: self._set_preview(img))
 
     def do_scan(self):
         self._start_bg(self._scan_job)
@@ -175,17 +310,19 @@ class ScannerApp(tk.Tk):
         dpi = self.dpi_var.get()
         mode = MODES[self.mode_var.get()]
         fmt = self.fmt_var.get().lower()
+        sel = self.sel_mm
         ext = {"png": "png", "jpeg": "jpg", "pdf": "pdf", "tiff": "tif"}[fmt]
         os.makedirs(SCAN_DIR, exist_ok=True)
         name = datetime.now().strftime("scan_%Y-%m-%d_%H-%M-%S") + "." + ext
         path = os.path.join(SCAN_DIR, name)
 
-        self.set_status(f"Scanning at {dpi} DPI… (may take minutes)", spinning=True)
-        self._scan_to_file(dpi, mode, fmt, path)
+        area = "full bed" if not sel else f"{sel[2]:.0f}x{sel[3]:.0f} mm"
+        self.set_status(f"Scanning {area} at {dpi} DPI… (may take minutes)", spinning=True)
+        self._scan_to_file(dpi, mode, fmt, path, sel_mm=sel)
         self.set_status(f"Saved: {name} ✔")
 
         if fmt == "png":
-            self.after(0, lambda: self._show_image(path))
+            self.after(0, lambda: self._show_result(path))
         else:
             self.after(0, self.canvas.delete, "all")
             self.after(0, lambda: self.canvas.create_text(
@@ -193,19 +330,112 @@ class ScannerApp(tk.Tk):
                 text=f"File saved:\n{path}\n\n(on-screen preview available for PNG only)"
             ))
 
-    def _show_image(self, path):
-        try:
-            img = tk.PhotoImage(file=path)
-        except tk.TclError:
+    def do_autocrop(self):
+        if self.preview_img is None:
+            self.set_status("Run a preview first, then Auto-crop.")
             return
-        cw = max(self.canvas.winfo_width(), 200)
-        ch = max(self.canvas.winfo_height(), 200)
-        factor = max(1, (img.width() + cw - 1) // cw, (img.height() + ch - 1) // ch)
-        if factor > 1:
-            img = img.subsample(factor, factor)
-        self.preview_img = img
+        sel = autocrop_sel_mm(self.preview_img)
+        if not sel:
+            self.set_status("Auto-crop: no document detected — keeping the full area.")
+            return
+        self._set_selection(sel)
+        self.set_status(f"Auto-crop: {sel[2]:.0f} x {sel[3]:.0f} mm ✔")
+
+    def clear_selection(self):
+        self._set_selection(None)
+        self.set_status("Scan area reset to the full bed.")
+
+    # ---------------- Preview rendering & selection ----------------
+    def _set_preview(self, pil_img):
+        # A scanned result is not a full-bed image, so it must not be selectable.
+        self.preview_img = pil_img
+        self._render()
+
+    def _show_result(self, path):
+        """Display a finished scan. Not usable as a selection surface."""
+        try:
+            img = Image.open(path)
+            img.load()
+        except OSError:
+            return
+        if self.sel_mm is None:
+            self.preview_img = img
+        self.tk_img = None
+        self._render(override=img)
+
+    def _set_selection(self, sel_mm):
+        self.sel_mm = sel_mm
+        self.area_var.set(describe_sel(sel_mm))
+        self._render()
+
+    def _render(self, override=None):
         self.canvas.delete("all")
-        self.canvas.create_image(cw // 2, ch // 2, image=img)
+        img = override if override is not None else self.preview_img
+        if img is None:
+            self.disp = None
+            self.canvas.create_text(
+                20, 20, anchor="nw", fill="#dddddd", font=("Segoe UI", 11),
+                text="No preview yet.\n\nClick \"Preview (75 DPI)\" to scan the whole bed,\n"
+                     "then drag on the image to select the area to scan."
+            )
+            return
+
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        x0, y0 = (cw - dw) // 2, (ch - dh) // 2
+        self.tk_img = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
+        self.canvas.create_image(x0, y0, anchor="nw", image=self.tk_img)
+
+        if override is None:
+            self.disp = (x0, y0, dw, dh)
+            self._draw_selection()
+        else:
+            self.disp = None
+
+    def _draw_selection(self):
+        if not self.sel_mm or not self.disp:
+            return
+        left, top, width, height = self.sel_mm
+        x0, y0 = mm_to_canvas(left, top, self.disp)
+        x1, y1 = mm_to_canvas(left + width, top + height, self.disp)
+        dx, dy, dw, dh = self.disp
+        # Dim everything outside the selection.
+        for box in ((dx, dy, dx + dw, y0), (dx, y1, dx + dw, dy + dh),
+                    (dx, y0, x0, y1), (x1, y0, dx + dw, y1)):
+            self.canvas.create_rectangle(*box, fill="#000000", outline="",
+                                         stipple="gray50", tags="sel")
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#00c853", width=2, tags="sel")
+
+    def _on_press(self, event):
+        if not self.disp:
+            return
+        self._drag_from = (event.x, event.y)
+
+    def _on_drag(self, event):
+        if not self._drag_from:
+            return
+        self.canvas.delete("rubber")
+        self.canvas.create_rectangle(
+            self._drag_from[0], self._drag_from[1], event.x, event.y,
+            outline="#00c853", width=2, dash=(4, 3), tags="rubber",
+        )
+
+    def _on_release(self, event):
+        if not self._drag_from:
+            return
+        start, self._drag_from = self._drag_from, None
+        self.canvas.delete("rubber")
+        sel = rect_to_sel_mm(start, (event.x, event.y), self.disp)
+        if sel is None:
+            # A click (or a selection under 5 mm) means "back to the full bed".
+            self._set_selection(None)
+            self.set_status("Scan area reset to the full bed.")
+            return
+        self._set_selection(sel)
+        self.set_status(f"Selected area: {sel[2]:.0f} x {sel[3]:.0f} mm ✔")
 
     def open_folder(self):
         os.makedirs(SCAN_DIR, exist_ok=True)
@@ -213,7 +443,7 @@ class ScannerApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    if not os.path.exists(SCANIMAGE):
+    if not os.environ.get("SCANNERCANOSCAN_SCANIMAGE") and not os.path.exists(SCANIMAGE):
         tk.Tk().withdraw()
         messagebox.showerror("Error", f"scanimage.exe not found:\n{SCANIMAGE}")
         sys.exit(1)
