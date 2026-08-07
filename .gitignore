@@ -2,6 +2,8 @@
 build/
 dist/
 *.spec
+# ...except ours: it carries the version resource and the UPX-off decision
+!ScannerCanoScan.spec
 
 # Binaries distributed via GitHub Releases, not in the repo
 ScannerCanoScan.exe

@@ -14,13 +14,20 @@ One single portable executable: **`ScannerCanoScan.exe`**. No installation, no W
 
 ## ✨ Features
 
-- **Preview** — quick 75 DPI scan shown on screen
+- **Preview** — quick 75 DPI scan of the whole flatbed, shown on screen
+- **Area selection** — drag a rectangle on the preview to scan only that part
+  (any shape: a photo, a receipt, a tall vertical strip). Click once to go back
+  to the full bed
+- **Auto-crop** — finds the document on the glass and sets the scan area to it
 - **Scan** — saves to the `Scans\` folder as `scan_DATE_TIME.ext`
 - Modes: Color / Grayscale / Black & white
 - Resolution: 75–600 DPI (these are USB 1.1 scanners — 600 DPI takes minutes)
 - Output formats: PNG, JPEG, PDF, TIFF
-- Full A4 flatbed area
+- Full A4 flatbed area by default
 - 100% portable: a single `.exe`, nothing else to install
+
+Selecting a smaller area does not just crop the image: the scanner head only
+travels over that region, so the scan is also proportionally **faster**.
 
 ## 🖨️ Supported scanners
 
@@ -71,7 +78,7 @@ Source: [SANE plustek backend documentation](http://www.sane-project.org/man/san
 
 Notes:
 - Only the **Canon N670U** has been tested by the author so far. All other models use the exact same driver code path, so they are expected to work. If you own one, please **open an issue** and report success/failure — the table will be updated.
-- The scan area is currently fixed to A4 (215×297 mm). Small sheetfed models (e.g. TravelScan, Strobe XP100) may need a smaller area — open an issue if you hit an error.
+- The maximum scan area is A4 (215×297 mm); you can select any smaller area from the preview. Small sheetfed models (e.g. TravelScan, Strobe XP100) may not accept the full A4 geometry — open an issue if you hit an error.
 - In the Zadig step below, select **your** scanner's USB ID from this table.
 
 ## 🚀 Installation (2 minutes)
@@ -87,8 +94,20 @@ You need two files from the [Releases](../../releases) page: `ScannerCanoScan.ex
 3. Run `ScannerCanoScan.exe`. Done.
 
 Notes:
-- **SmartScreen** may warn you the first time (the exe is not code-signed): click *More info* → *Run anyway*.
+- **SmartScreen** may warn you the first time (the exe is not code-signed yet): click *More info* → *Run anyway*.
 - The WinUSB driver replaces any previous driver for the scanner (on modern 64-bit Windows there is no official one anyway). This is fully reversible from Device Manager.
+
+## 🖱️ Scanning part of the page
+
+1. Click **Preview (75 DPI)** — the whole flatbed is scanned and shown.
+2. **Drag** a rectangle on the preview over what you want. The selected size in
+   millimetres appears under *Scan area*. Or click **Auto-crop** and let the app
+   find the document by itself.
+3. Choose mode, DPI and format, then click **SCAN**. Only the selected area is
+   scanned, so it is also faster.
+
+A single click on the preview (or **Reset to full area**) goes back to the whole
+bed. The selection survives further previews, so you can refine it.
 
 ## 🔧 How it works
 
@@ -105,17 +124,21 @@ The executable bundles the open-source **SANE** scanner driver (plustek backend,
 
 ## 🛠️ Building from source
 
-Prerequisites: Python 3.10+ with tkinter, PyInstaller (`pip install pyinstaller`).
+Prerequisites: Python 3.10+ with tkinter, plus `pip install pyinstaller pillow`.
 
-```bat
+```powershell
 git clone https://github.com/3Visualcode/ScannerCanoScan.git
 cd ScannerCanoScan
-python -m PyInstaller --onefile --windowed --name ScannerCanoScan ^
-  --add-data "sane-win64;sane-win64" scanner_app.py
+.\build.ps1
 ```
 
-The executable is produced in `dist\ScannerCanoScan.exe`.
-Development run without building: `python scanner_app.py` (uses the `sane-win64\` folder next to the source).
+`build.ps1` runs the test suite, builds `dist\ScannerCanoScan.exe` from
+`ScannerCanoScan.spec`, and can code-sign it (`-CertSubject`, `-PfxPath` or
+`-TrustedSigningMetadata` — see `Get-Help .\build.ps1 -Full`).
+
+Development run without building: `python scanner_app.py` (uses the
+`sane-win64\` folder next to the source). You do not need a scanner to work on
+the GUI — see [DEVELOPMENT.md](DEVELOPMENT.md) §9 for the simulated scanner.
 
 ## 🔍 Troubleshooting
 

@@ -27,7 +27,7 @@ USB scanner → WinUSB driver (Microsoft, installed with Zadig)
            → SANE plustek backend 1.0.32 (Cygwin port for Windows)
            → scanimage.exe
            → Python/tkinter GUI (scanner_app.py)
-           → PyInstaller onefile = ScannerCanoScan.exe (15 MB)
+           → PyInstaller onefile = ScannerCanoScan.exe (~21 MB)
 ```
 
 - **SANE** = open-source scanner driver framework (Linux project); the
@@ -54,7 +54,13 @@ USB scanner → WinUSB driver (Microsoft, installed with Zadig)
 |---|---|
 | `ScannerCanoScan.exe` | Final product, self-contained |
 | `zadig.exe` | WinUSB driver installer (v2.9, from zadig.akeo.ie) |
-| `scanner_app.py` | GUI source (single file, stdlib only) |
+| `scanner_app.py` | GUI source (single file; stdlib + Pillow) |
+| `ScannerCanoScan.spec` | PyInstaller recipe (UPX off, version resource on) |
+| `version_info.txt` | Windows version resource — keep in sync with `APP_VERSION` |
+| `build.ps1` | Test + build + optional code signing |
+| `tools\mock_scanimage.py` | Simulated scanner, for developing without hardware |
+| `tools\selftest.py` | Headless checks: geometry, auto-crop, paths |
+| `tools\smoketest.py` | End-to-end GUI run against the simulated scanner |
 | `sane-win64\` | Native SANE: needed for source runs and rebuilds |
 | `Scans\` | Output (`scan_YYYY-MM-DD_HH-MM-SS.ext`) |
 | `README.md` | User manual + distribution instructions |
@@ -64,9 +70,15 @@ USB scanner → WinUSB driver (Microsoft, installed with Zadig)
 
 1. **Scan area**: by default the plustek backend scans ONLY 103×76 mm (one
    corner). Passing `-l 0 -t 0 -x 215 -y 297` is mandatory for the full A4
-   flatbed. Already done via `FULL_AREA` in scanner_app.py. Sheetfed models
+   flatbed. Since v1.1 the geometry is built by `area_args()` from the current
+   selection; with no selection it falls back to the full bed. In SANE, `-l/-t`
+   are the top-left corner and **`-x/-y` are width and height**, not the far
+   corner — getting that wrong silently scans the wrong region. Sheetfed models
    (TravelScan, Strobe XP100) may have a smaller maximum area — if scanimage
    rejects the geometry, the area needs to be made model-dependent.
+   **Not yet verified on hardware** (see §10): that the backend's origin is the
+   top-left of the glass with no mirroring, and that it does not quantise
+   arbitrary `-l/-t` values.
 2. **Paths for scanimage**: it is a Cygwin binary → Windows paths must be
    converted to `/cygdrive/c/...` (function `to_cygpath`).
 3. **cwd**: scanimage should be launched with `cwd = sane-win64\bin` (DLLs
@@ -79,8 +91,14 @@ USB scanner → WinUSB driver (Microsoft, installed with Zadig)
 6. **SmartScreen**: unsigned exe → warning on first run on new PCs.
    "More info → Run anyway".
 7. **Formats**: PNG/JPEG/PDF/TIFF are produced directly by scanimage
-   (`--format=...`); the GUI performs no conversions. On-screen preview is
-   PNG only (tk.PhotoImage reads only PNG/GIF).
+   (`--format=...`); the GUI performs no conversions. The on-screen display of
+   a finished scan is still PNG only (the other formats are not re-read).
+8. **Pillow** is a dependency since v1.1 (preview scaling, auto-crop). It is
+   the only non-stdlib import; `tk.PhotoImage` could not do either.
+9. **Preview is always the full bed**, whatever the selection — it is the
+   surface you select on. Only `SCAN` honours the selection.
+10. **Same-second scans overwrite each other**: the filename has one-second
+    resolution. Only reachable by scripting the app, harmless in the GUI.
 
 ## 5. Project history and dead ends (do NOT retrace them)
 
@@ -106,18 +124,39 @@ to Windows. Survives reboots and re-plugs.
 
 ## 6. How to rebuild the exe
 
-Prerequisites: Python 3.10+ (3.14 used originally), PyInstaller 6.x
-(`python -m pip install --user pyinstaller`).
+Prerequisites: Python 3.10+ (3.14 used), `pip install pyinstaller pillow`.
 
-```bat
+```powershell
 cd ScannerCanoScan
-python -m PyInstaller --onefile --windowed --name ScannerCanoScan ^
-  --add-data "sane-win64;sane-win64" scanner_app.py
+.\build.ps1              # tests + build
+.\build.ps1 -SkipTests   # build only
 ```
 
 Resulting exe in `dist\ScannerCanoScan.exe` → copy it to the folder root.
 Development run without building: `python scanner_app.py` (uses the
 `sane-win64\` folder next to the source).
+
+### 6.1 Code signing
+
+Unsigned, SmartScreen shows "Unknown publisher" and users need
+*More info → Run anyway*. Signing replaces that with **Host Service srl**.
+`build.ps1` handles it; you only have to obtain a certificate. Self-signed
+certificates are useless here — SmartScreen ignores them.
+
+| Option | Indicative cost | Notes |
+|---|---|---|
+| **Azure Trusted Signing** | ~10 USD/month | Best fit: needs a registered company with a verifiable history (~3 years). No hardware token, works in CI. `build.ps1 -TrustedSigningMetadata .\trusted-signing.json` |
+| OV certificate | ~250–500 €/year | Hardware token/HSM mandatory since the 2023 CA/Browser rules. SmartScreen reputation builds up over downloads |
+| EV certificate | ~350–700 €/year | Hardware token. Immediate SmartScreen reputation |
+| SignPath Foundation | free | Open-source projects only, application + approval needed |
+
+Prices change — verify before buying. Once a certificate is in the Windows
+store (typical for token-based OV/EV), `build.ps1 -CertSubject "Host Service srl"`
+is enough.
+
+Related: UPX compression is disabled in the spec on purpose — packed
+executables trigger antivirus false positives, which defeats the point of
+signing.
 
 ## 7. Quick diagnostics
 
@@ -143,7 +182,57 @@ Typical errors:
 
 - Custom icon for the exe (`--icon file.ico`).
 - Multi-page PDF (scanimage `--batch` + concatenation).
-- Code-sign the exe to avoid SmartScreen.
-- Automatic document-area cropping.
 - Model-dependent scan area (needed for sheetfed models, see §4.1).
 - UI language selection (currently English only).
+- Rotate / straighten the auto-detected document (currently axis-aligned only).
+- Display finished scans in formats other than PNG.
+
+Done in v1.1: area selection, auto-crop, version resource, signing pipeline.
+
+## 9. Developing without a scanner
+
+`tools\mock_scanimage.py` is a drop-in replacement for `scanimage.exe`. It
+accepts the same options, simulates a flatbed with a 127×178 mm document lying
+at offset (30, 45) mm — deliberately off-centre, so a mirrored or misplaced
+origin is obvious — and renders exactly the region requested.
+
+```powershell
+$env:SCANNERCANOSCAN_SCANIMAGE = "$PWD\tools\mock_scanimage.py"
+python scanner_app.py          # the whole GUI, no hardware
+Remove-Item Env:\SCANNERCANOSCAN_SCANIMAGE
+```
+
+Every call is logged to `%TEMP%\mock_scanimage_calls.log`
+(override with `SCANNERCANOSCAN_MOCK_LOG`), so you can check the geometry that
+was actually requested.
+
+The override only accepts an `.exe` in the packaged build: inside PyInstaller
+`sys.executable` is the app itself, not a Python interpreter, so a `.py` mock
+would relaunch the GUI. `scanimage_cmd()` raises instead.
+
+Two test suites, both hardware-free:
+
+```powershell
+python tools\selftest.py    # geometry, auto-crop, path conversion - no GUI
+python tools\smoketest.py   # real ScannerApp driven end to end (a window flashes)
+```
+
+`selftest.py` covers the pure functions (`canvas_to_mm`, `rect_to_sel_mm`,
+`area_args`, `autocrop_sel_mm`, `to_cygpath`). `smoketest.py` drives the actual
+Tk app: preview → auto-crop → simulated mouse drag → scan, then verifies the
+geometry that reached scanimage and the pixel size of every output format.
+
+## 10. What still needs the real device
+
+Everything above is simulated, so these assumptions remain unproven:
+
+1. The plustek origin is the top-left of the glass, with no mirrored axis.
+   Test: put a small object in one corner, select it from the preview, scan,
+   check you got that corner and not another.
+2. The backend accepts arbitrary `-l/-t/-x/-y` values without quantising or
+   rounding them to a grid.
+3. Very small areas (a few mm) do not make the backend fail or hang.
+4. Scan time really does drop proportionally to the selected area.
+5. Auto-crop tolerance (18/255 on the grey level) is right for a real glass
+   with the lid closed. Real backgrounds are noisier than the simulated one;
+   if auto-crop grabs the whole bed, raise `tolerance` in `autocrop_sel_mm()`.
