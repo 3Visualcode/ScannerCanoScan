@@ -12,6 +12,14 @@ Usage:
 
 Every call is appended to %TEMP%\\mock_scanimage_calls.log (override with
 SCANNERCANOSCAN_MOCK_LOG), so you can check the geometry actually requested.
+
+SCANNERCANOSCAN_MOCK_DEVICE selects the simulated scanner: "plustek" (default,
+Canon N670U), "plustek_lide30" (Canon LiDE 30), "plustek_nohelp" (a plustek
+scanner whose --help fails) or "artec_eplus48u" (Trust Easy Webscan 19200). The
+artec one only accepts its fixed resolution list, like the real backend.
+
+The --resolution lines follow scanimage's format, but the plustek maximums are
+assumptions: what the real backend reports per model needs the real hardware.
 """
 
 import os
@@ -28,8 +36,27 @@ BED_H_MM = 297.0
 DOC_MM = (30.0, 45.0, 127.0, 178.0)   # left, top, width, height
 
 BG_LEVEL = 244            # empty glass, lid closed
-DEVICE_LINE = ("device `plustek:libusb:001:002' is a Canon "
-               "CanoScan N670U/N676U/LiDE20 flatbed scanner")
+DEVICES = {
+    "plustek": ("device `plustek:libusb:001:002' is a Canon "
+                "CanoScan N670U/N676U/LiDE20 flatbed scanner"),
+    "artec_eplus48u": ("device `artec_eplus48u:libusb:001:003' is a Trust "
+                       "Easy Webscan 19200 flatbed scanner"),
+    "plustek_lide30": ("device `plustek:libusb:001:004' is a Canon "
+                       "CanoScan N1240U/LiDE30 flatbed scanner"),
+    "plustek_nohelp": ("device `plustek:libusb:001:005' is a Canon "
+                       "CanoScan N670U/N676U/LiDE20 flatbed scanner"),
+}
+HELP_RESOLUTION = {
+    "plustek": "--resolution 50..600dpi [50]",
+    "plustek_lide30": "--resolution 50..1200dpi [50]",
+    "artec_eplus48u": "--resolution 50|100|200|300|600|1200dpi [300]",
+}
+# The real artec_eplus48u backend has a fixed word list; plustek takes a range.
+ALLOWED_DPI = {"artec_eplus48u": (50, 100, 200, 300, 600, 1200)}
+
+
+def device():
+    return os.environ.get("SCANNERCANOSCAN_MOCK_DEVICE", "plustek")
 
 
 def log_call(argv):
@@ -101,12 +128,27 @@ def render(opts):
 def main(argv):
     log_call(argv)
     if "-L" in argv or "--list-devices" in argv:
-        print(DEVICE_LINE)
+        print(DEVICES[device()])
+        return 0
+    if "--help" in argv:
+        print("Usage: scanimage [OPTION]...\n")
+        line = HELP_RESOLUTION.get(device())
+        if not line:
+            sys.stderr.write("scanimage: open of device failed: Error during device I/O\n")
+            return 1
+        print("Options specific to device:\n  Scan Mode:\n"
+              "    --mode Lineart|Gray|Color [Color]\n"
+              f"    {line}\n        Sets the resolution of the scanned image.")
         return 0
 
     opts = parse_args(argv)
     if not opts["output"]:
         sys.stderr.write("mock_scanimage: no -o output file given\n")
+        return 1
+    allowed = ALLOWED_DPI.get(device())
+    if allowed and opts["resolution"] not in allowed:
+        sys.stderr.write(f"mock_scanimage: {device()} rejects {opts['resolution']} dpi "
+                         f"(allowed: {allowed})\n")
         return 1
 
     img = render(opts)

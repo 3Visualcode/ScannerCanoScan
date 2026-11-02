@@ -22,3 +22,6 @@ Scansioni/
 
 # Local scratch
 *.tmp
+
+# Proprietary scanner firmware (GT6816 models, see README) - never commit it
+*.usb

@@ -1,6 +1,6 @@
 # ScannerCanoScan
 
-**Free, open-source scanning software for Windows 10/11 (64-bit) for old USB scanners based on the National Semiconductor LM9831/LM9832/LM9833 chips** — such as the Canon CanoScan N670U — that never got official 64-bit Windows drivers.
+**Free, open-source scanning software for Windows 10/11 (64-bit) for old USB scanners that never got official 64-bit Windows drivers**: the National Semiconductor **LM9831/LM9832/LM9833** family (Canon CanoScan N670U, LiDE 20/25/30, …) and the **GT6816** family (Trust Easy Webscan 19200, Artec E+ 48U, Medion, UMAX AstraSlim, …).
 
 One single portable executable: **`ScannerCanoScan.exe`**. No installation, no WSL, no virtual machines, no paid software.
 
@@ -8,7 +8,7 @@ One single portable executable: **`ScannerCanoScan.exe`**. No installation, no W
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011%20(64--bit)-blue)
 ![License](https://img.shields.io/badge/GUI%20license-MIT-green)
-![SANE](https://img.shields.io/badge/driver-SANE%20plustek-orange)
+![SANE](https://img.shields.io/badge/driver-SANE%20plustek%20%2B%20artec__eplus48u-orange)
 
 ---
 
@@ -21,7 +21,11 @@ One single portable executable: **`ScannerCanoScan.exe`**. No installation, no W
 - **Auto-crop** — finds the document on the glass and sets the scan area to it
 - **Scan** — saves to the `Scans\` folder as `scan_DATE_TIME.ext`
 - Modes: Color / Grayscale / Black & white
-- Resolution: 75–600 DPI (these are USB 1.1 scanners — 600 DPI takes minutes)
+- Resolution: LM983x models offer what the connected scanner reports (75–600
+  DPI if it reports nothing), GT6816 models 50–1200 DPI. The list adapts to the
+  scanner that is detected. These are USB 1.1 scanners: 600 DPI takes minutes,
+  and 1200 DPI on the full bed in colour is about 430 MB of data, so select an
+  area when you can
 - Output formats: PNG, JPEG, PDF, TIFF
 - Full A4 flatbed area by default
 - 100% portable: a single `.exe`, nothing else to install
@@ -31,7 +35,10 @@ travels over that region, so the scan is also proportionally **faster**.
 
 ## 🖨️ Supported scanners
 
-The bundled driver is the SANE **plustek** backend, which supports all USB scanners built on the **LM9831 / LM9832 / LM9833** chips.
+Two SANE backends are bundled. The app detects which one your scanner uses
+and adapts the resolution list and the preview accordingly.
+
+### LM9831 / LM9832 / LM9833 chips — SANE `plustek` backend
 
 **Tested and confirmed working:**
 
@@ -76,10 +83,46 @@ The bundled driver is the SANE **plustek** backend, which supports all USB scann
 
 Source: [SANE plustek backend documentation](http://www.sane-project.org/man/sane-plustek.5.html).
 
+### GT6816 chip — SANE `artec_eplus48u` backend (needs a firmware file)
+
+**Supported by the backend (untested on Windows so far — reports welcome!):**
+
+| Vendor | Model | USB ID | Firmware file |
+|---|---|---|---|
+| Trust | **Easy Webscan 19200** | `05D8:4006` | `Artec48.usb` |
+| Trust | 240H Easy Webscan Gold | `05D8:4007` | `Artec48.usb` |
+| Artec | E+ 48U | `05D8:4003` | `Artec48.usb` |
+| Artec | E+ Pro | `05D8:4004` | `1200.usb` |
+| Medion / Tevion | MD 9693, MD 9705, MD 4394 | `05D8:4003` | `Artec48.usb` |
+| Memorex | MEM 48U | `05D8:4005` | `Artec48.usb` |
+| UMAX | AstraSlim SE | `05D8:4009` | `Artec48.usb` |
+| UMAX | AstraSlim 1200 SE | `05D8:4010` | `1200.usb` |
+| Yakumo | Scan50 | `05D8:4011` | `Artec48.usb` |
+
+Source: [SANE artec_eplus48u backend documentation](http://www.sane-project.org/man/sane-artec_eplus48u.5.html).
+
+These scanners have no firmware on board: the driver uploads it over USB every
+time the scanner is opened. The firmware is proprietary, so **it is not included**
+in this project. You need the file **once**, from the original driver:
+
+- on the **driver CD** that came with the scanner (look for `Artec48.usb`, often
+  in a `Win98` / `WinMe` / `Driver` folder), or
+- in `C:\Windows\System32\drivers\Artec48.usb` on any PC where the old Windows
+  driver was installed, or
+- inside the driver package downloadable from the vendor's support site
+  (for the Trust 19200 it is Trust item 12388; unzip the installer with 7-Zip
+  and search for `*.usb`).
+
+`Artec48.usb` is 8192 bytes (MD5 `55113258bc41f30ef5f5be748e1b01ee`).
+
+The first time the app detects a GT6816 scanner it asks you to locate the file
+and copies it next to `ScannerCanoScan.exe`; after that it is remembered. You
+can also just drop the file next to the exe yourself.
+
 Notes:
-- Only the **Canon N670U** has been tested by the author so far. All other models use the exact same driver code path, so they are expected to work. If you own one, please **open an issue** and report success/failure — the table will be updated.
+- Only the **Canon N670U** has been tested by the author so far. All other models use the same driver code paths, so they are expected to work. If you own one, please **open an issue** and report success/failure — the tables will be updated.
 - The maximum scan area is A4 (215×297 mm); you can select any smaller area from the preview. Small sheetfed models (e.g. TravelScan, Strobe XP100) may not accept the full A4 geometry — open an issue if you hit an error.
-- In the Zadig step below, select **your** scanner's USB ID from this table.
+- In the Zadig step below, select **your** scanner's USB ID from these tables.
 
 ## 🚀 Installation (2 minutes)
 
@@ -89,9 +132,13 @@ You need two files from the [Releases](../../releases) page: `ScannerCanoScan.ex
 2. **One time only** — install the generic WinUSB driver:
    - Run `zadig.exe` ([Zadig](https://zadig.akeo.ie/) by Pete Batard)
    - Menu *Options* → *List All Devices*
-   - Select your scanner (e.g. **CanoScan**, USB ID `04A9 220D` — check the table above)
+   - Select your scanner (e.g. **CanoScan**, USB ID `04A9 220D`, or the Trust
+     Easy Webscan 19200, USB ID `05D8 4006` — check the tables above)
    - Target driver: **WinUSB** → click *Install Driver*
 3. Run `ScannerCanoScan.exe`. Done.
+4. **GT6816 scanners only** (Trust Easy Webscan 19200 & co.): the app asks for
+   the firmware file `Artec48.usb` the first time — see *Supported scanners*
+   above for where to find it.
 
 Notes:
 - **SmartScreen** may warn you the first time (the exe is not code-signed yet): click *More info* → *Run anyway*.
@@ -136,7 +183,7 @@ its own driver for the scanner as usual. Running Zadig again re-enables this app
 
 ## 🖱️ Scanning part of the page
 
-1. Click **Preview (75 DPI)** — the whole flatbed is scanned and shown.
+1. Click **Preview** — the whole flatbed is scanned at low resolution and shown.
 2. **Drag** a rectangle on the preview over what you want. The selected size in
    millimetres appears under *Scan area*. Or click **Auto-crop** and let the app
    find the document by itself.
@@ -151,13 +198,15 @@ bed. The selection survives further previews, so you can refine it.
 ```
 USB scanner → WinUSB driver (Microsoft, installed via Zadig)
            → libusb (cygusb-1.0.dll)
-           → SANE "plustek" backend 1.0.32 (Cygwin port for Windows)
+           → SANE backend 1.0.32 (Cygwin port for Windows):
+                "plustek"        for LM9831/2/3 chips
+                "artec_eplus48u" for GT6816 chips (+ Artec48.usb firmware upload)
            → scanimage.exe
            → Python/tkinter GUI (scanner_app.py)
            → PyInstaller onefile = ScannerCanoScan.exe
 ```
 
-The executable bundles the open-source **SANE** scanner driver (plustek backend, for LM983x chips) compiled for Windows via the Cygwin port [revvv/sane-backends-cygwin](https://github.com/revvv/sane-backends-cygwin), together with the required Cygwin DLLs. The GUI (single-file Python/tkinter, standard library only) invokes `scanimage.exe` and saves the output.
+The executable bundles the open-source **SANE** scanner drivers (plustek and artec_eplus48u backends) compiled for Windows via the Cygwin port [revvv/sane-backends-cygwin](https://github.com/revvv/sane-backends-cygwin), together with the required Cygwin DLLs. The GUI (single-file Python/tkinter + Pillow) invokes `scanimage.exe`, reads which backend answered, and saves the output.
 
 ## 🛠️ Building from source
 
@@ -184,8 +233,16 @@ the GUI — see [DEVELOPMENT.md](DEVELOPMENT.md) §9 for the simulated scanner.
   ```
   sane-win64\bin\scanimage.exe -L
   ```
-  Expected: `device 'plustek:libusb:NNN:NNN' is a Canon CanoScan N670U/N676U/LiDE20` (or your model).
+  Expected: `device 'plustek:libusb:NNN:NNN' is a Canon CanoScan N670U/N676U/LiDE20`
+  or `device 'artec_eplus48u:libusb:NNN:NNN' is a Trust Easy Webscan 19200` (or your model).
 - `Operation not supported` on the USB device → WinUSB driver missing → run Zadig.
+- **GT6816 scanner detected but every scan fails** → the firmware is missing or
+  is the wrong file. Check that `Artec48.usb` (8192 bytes) sits next to
+  `ScannerCanoScan.exe`, then click *Check scanner*. For a detailed log:
+  ```
+  set SANE_DEBUG_ARTEC_EPLUS48U=5
+  sane-win64\bin\scanimage.exe -L
+  ```
 - Exit code `-1073741515` (0xC0000135) → a Cygwin DLL is missing next to `scanimage.exe`.
 - `no SANE devices found` with the driver OK → try another USB cable/port.
 - First scan slower than usual → cold lamp warm-up. Normal for these scanners.
@@ -204,7 +261,8 @@ Even just a ⭐ star on the repository or a compatibility report for your scanne
 | Component | License | Source |
 |---|---|---|
 | GUI (`scanner_app.py`) | MIT | this repository ([LICENSE](LICENSE)) |
-| SANE backends (`scanimage.exe`, plustek) | GPL v2 (with SANE exception) | [sane-project.org](http://www.sane-project.org/), [revvv/sane-backends-cygwin](https://github.com/revvv/sane-backends-cygwin) |
+| SANE backends (`scanimage.exe`, plustek, artec_eplus48u) | GPL v2 (with SANE exception) | [sane-project.org](http://www.sane-project.org/), [revvv/sane-backends-cygwin](https://github.com/revvv/sane-backends-cygwin) |
+| GT6816 firmware (`Artec48.usb`) | proprietary — **not included**, taken from your own driver CD | Artec / Trust / your scanner vendor |
 | Cygwin runtime DLLs (`cygwin1.dll`, …) | LGPL v3 | [cygwin.com](https://cygwin.com/) |
 | Zadig | GPL v3 | [zadig.akeo.ie](https://zadig.akeo.ie/) |
 
@@ -216,3 +274,4 @@ If you redistribute the executable, keep this file with it (it tells users where
 - [revvv](https://github.com/revvv/sane-backends-cygwin) — the native Windows port of SANE
 - [Pete Batard](https://zadig.akeo.ie/) — Zadig / libwdi
 - Gerhard Jäger — the SANE plustek backend for LM983x chips
+- Michael Herder — the SANE artec_eplus48u backend for GT6816 chips

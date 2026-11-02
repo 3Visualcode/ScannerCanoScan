@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.2.0
+
+Added:
+- **GT6816 scanners** (Trust Easy Webscan 19200, Trust 240H Easy Webscan Gold,
+  Artec E+ 48U / E+ Pro, Medion MD 9693/9705/4394, Memorex MEM 48U, UMAX
+  AstraSlim SE / 1200 SE, Yakumo Scan50): the SANE `artec_eplus48u` backend is
+  now bundled next to `plustek`. The app detects which backend answers and
+  adapts the resolution list (50–1200 DPI on GT6816) and the preview (50 DPI).
+- **Firmware handling** for those scanners: they need the proprietary
+  `Artec48.usb` from their original driver. The app asks for it once, keeps a
+  copy next to the executable and installs it where the backend expects it on
+  every start. The firmware is not distributed with this project.
+- **Resolution list per scanner** on LM983x models: read from the backend for
+  the connected scanner instead of a fixed 75–600 DPI list, so models that
+  support it can go above 600 DPI (requested for the LiDE 30). If the scanner
+  does not report a range the list stays 75–600 DPI. The settings panel shows
+  which of the two happened.
+- The scan timeout grows with resolution, mode and area (it was always 15
+  minutes), and scans above 40 megapixels are saved without being loaded on
+  screen.
+- The detected scanner model is shown in the settings panel.
+- README: step-by-step guide to remove the WinUSB driver and go back to the
+  original state (Device Manager, `pnputil`, libwdi certificate).
+- The simulated scanner can impersonate a Trust Easy Webscan 19200
+  (`SCANNERCANOSCAN_MOCK_DEVICE=artec_eplus48u`); both test suites cover the
+  backend switch and the firmware logic.
+
+Unchanged for LM983x scanners (Canon N670U & co.): same backend build, same
+scan arguments, same 75 DPI preview as 1.1.0.
+
+Not yet verified on hardware: nobody has run the artec_eplus48u backend on
+Windows so far, and the resolution range the plustek backend reports per model
+has not been seen on a real scanner. See DEVELOPMENT.md §10.
+
 ## 1.1.0
 
 Added:

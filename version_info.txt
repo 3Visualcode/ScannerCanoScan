@@ -2,8 +2,8 @@
 # Keep the numbers in sync with APP_VERSION in scanner_app.py.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(1, 2, 0, 0),
+    prodvers=(1, 2, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,13 +16,13 @@ VSVersionInfo(
       StringTable(
         '040904B0',
         [StringStruct('CompanyName', 'Host Service srl'),
-         StringStruct('FileDescription', 'ScannerCanoScan - scanning software for LM983x USB scanners'),
-         StringStruct('FileVersion', '1.1.0.0'),
+         StringStruct('FileDescription', 'ScannerCanoScan - scanning software for LM983x and GT6816 USB scanners'),
+         StringStruct('FileVersion', '1.2.0.0'),
          StringStruct('InternalName', 'ScannerCanoScan'),
          StringStruct('LegalCopyright', 'Copyright (c) Host Service srl - MIT License'),
          StringStruct('OriginalFilename', 'ScannerCanoScan.exe'),
          StringStruct('ProductName', 'ScannerCanoScan'),
-         StringStruct('ProductVersion', '1.1.0.0')])
+         StringStruct('ProductVersion', '1.2.0.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

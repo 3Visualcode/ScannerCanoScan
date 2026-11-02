@@ -1,24 +1,29 @@
 """
-ScannerCanoScan - Free scanning software for LM983x-based USB scanners
-(Canon CanoScan N670U and other models supported by the SANE "plustek" backend).
+ScannerCanoScan - Free scanning software for old USB flatbed scanners that
+never got 64-bit Windows drivers:
+  - LM9831/2/3 chips (Canon CanoScan N670U, LiDE 20/25/30, ...)  -> SANE "plustek"
+  - GT6816 chips (Trust Easy Webscan 19200, Artec E+ 48U, ...)   -> SANE "artec_eplus48u"
 
-100% native Windows: SANE (plustek backend) compiled for Windows (Cygwin port),
-scanner accessed through the WinUSB driver (installed once with Zadig).
-No external runtime dependencies: everything is bundled inside the executable.
+100% native Windows: SANE backends compiled for Windows (Cygwin port), scanner
+accessed through the WinUSB driver (installed once with Zadig).
+No external runtime dependencies: everything is bundled inside the executable,
+except the proprietary firmware the GT6816 scanners need (see FIRMWARE_NAMES).
 """
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageChops, ImageTk
 
 APP_NAME = "ScannerCanoScan"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 if getattr(sys, "frozen", False):
     BUNDLE_DIR = sys._MEIPASS            # resources extracted by PyInstaller
@@ -27,13 +32,58 @@ else:
     BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
     APP_DIR = BUNDLE_DIR
 
-SANE_BIN = os.path.join(BUNDLE_DIR, "sane-win64", "bin")
+SANE_ROOT = os.path.join(BUNDLE_DIR, "sane-win64")   # Cygwin "/" for scanimage
+SANE_BIN = os.path.join(SANE_ROOT, "bin")
 SCANIMAGE = os.path.join(SANE_BIN, "scanimage.exe")
 SCAN_DIR = os.path.join(APP_DIR, "Scans")
 
+# Where artec_eplus48u.conf expects the firmware:
+# "/usr/local/share/sane/artec_eplus48u/Artec48.usb" under the Cygwin root.
+# In the packaged build this lives in the PyInstaller temp dir, which is
+# recreated on every start, so the firmware is copied there from FIRMWARE_HOME.
+FIRMWARE_DIR = os.path.join(SANE_ROOT, "usr", "local", "share", "sane", "artec_eplus48u")
+FIRMWARE_HOME = APP_DIR                     # where the user's copy is kept
+FIRMWARE_NAMES = ("Artec48.usb", "1200.usb")  # 1200.usb: E+ Pro / AstraSlim 1200 SE
+
 MODES = {"Color": "Color", "Grayscale": "Gray", "Black & white": "Lineart"}
-DPI_VALUES = ["75", "150", "300", "600"]
 FORMATS = ["PNG", "JPEG", "PDF", "TIFF"]
+
+# One entry per bundled SANE backend (see sane-win64\usr\local\etc\sane.d\dll.conf).
+#   dpi         resolutions offered (artec_eplus48u has a fixed list; for plustek
+#               this is only the fallback, see query_dpi)
+#   query_dpi   ask the backend what the connected model supports: the maximum
+#               differs between models of the same chip family (LiDE 30 vs N670U)
+#   preview_dpi fastest resolution good enough to select an area on
+#   firmware    the backend uploads a firmware file to the scanner at every open
+BACKENDS = {
+    "plustek": {
+        "chip": "LM983x",
+        "dpi": ["75", "150", "300", "600"],
+        "query_dpi": True,
+        "preview_dpi": 75,
+        "firmware": False,
+    },
+    "artec_eplus48u": {
+        "chip": "GT6816",
+        "dpi": ["50", "100", "200", "300", "600", "1200"],
+        "query_dpi": False,
+        "preview_dpi": 50,
+        "firmware": True,
+    },
+}
+DEFAULT_BACKEND = "plustek"
+DEFAULT_DPI = "300"
+# A backend that reports a range accepts any value in it: offer these steps.
+STANDARD_DPI = (75, 150, 300, 600, 1200, 2400)
+
+# The scan timeout is a watchdog against a hung scanner, not an estimate. It must
+# not kill a slow but healthy scan: these are USB 1.1 devices and 1200 DPI on the
+# full bed is about 430 MB of raw data.
+SCAN_TIMEOUT_MIN_S = 900
+SCAN_MIN_BYTES_PER_S = 50_000
+BYTES_PER_PIXEL = {"Color": 3, "Gray": 1, "Lineart": 0.125}
+# Above this a finished scan is not loaded for display (600 DPI full bed = 36 Mpx).
+MAX_ONSCREEN_PIXELS = 40_000_000
 
 # Full flatbed area in mm (the backend default is only 103x76mm).
 BED_W_MM = 215.0
@@ -76,6 +126,108 @@ def run_scanimage(args, timeout=900):
     return p.returncode, p.stdout, p.stderr
 
 
+# ---------------- Backend detection & firmware (unit-testable without Tk) ----------------
+
+_DEVICE_RE = re.compile(r"device\s+[`'\"]?(\w+):([^`'\"\s]*)[`'\"]?\s+is\s+an?\s+(.+)")
+
+
+def parse_device_list(txt):
+    """`scanimage -L` output -> (backend, device, description) of the scanner.
+
+    Lines look like:
+      device `plustek:libusb:001:002' is a Canon CanoScan N670U/N676U/LiDE20 flatbed scanner
+    If several devices are listed, the first one whose backend we know wins."""
+    found = []
+    for line in txt.splitlines():
+        m = _DEVICE_RE.search(line)
+        if m:
+            found.append((m.group(1), m.group(2), m.group(3).strip()))
+    for backend, dev, desc in found:
+        if backend in BACKENDS:
+            return backend, dev, desc
+    return found[0] if found else None
+
+
+_RESOLUTION_RE = re.compile(
+    r"^\s*--resolution\s+(?:auto\|)?([^\s\[(]+)(?:\s*\(in steps of ([\d.]+)\))?", re.M)
+
+
+def parse_dpi_choices(txt):
+    """`scanimage --help -d DEVICE` output -> resolutions to offer, None if unknown.
+
+    The option line is a range or a word list, depending on the backend:
+      --resolution 50..1200dpi [50]
+      --resolution 50..1200dpi (in steps of 25) [50]
+      --resolution 50|100|200|300|600|1200dpi [300]"""
+    m = _RESOLUTION_RE.search(txt)
+    if not m:
+        return None
+    values = re.sub(r"[A-Za-z]+$", "", m.group(1))
+    try:
+        if ".." in values:
+            lo, hi = (float(v) for v in values.split("..", 1))
+            step = float(m.group(2) or 0)
+            choices = [d for d in STANDARD_DPI
+                       if lo <= d <= hi and (step <= 1 or (d - lo) % step == 0)]
+        else:
+            choices = sorted(int(float(v)) for v in values.split("|"))
+    except ValueError:
+        return None
+    return [str(d) for d in choices] or None
+
+
+def query_dpi_choices(backend, dev):
+    """Resolutions the connected scanner supports, None if it cannot be told.
+    Never raises: the fallback list is a working configuration."""
+    try:
+        _rc, out, err = run_scanimage(["--help", "-d", f"{backend}:{dev}"], timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_dpi_choices((out + err).decode(errors="replace"))
+
+
+def find_firmware(folder):
+    """Path of the first firmware file (FIRMWARE_NAMES, case-insensitive) in folder."""
+    if not folder or not os.path.isdir(folder):
+        return None
+    wanted = {n.lower() for n in FIRMWARE_NAMES}
+    for entry in sorted(os.listdir(folder)):
+        if entry.lower() in wanted:
+            return os.path.join(folder, entry)
+    return None
+
+
+def install_firmware(src):
+    """Copy a firmware file to the backend folder and keep a copy in FIRMWARE_HOME.
+
+    Returns the path inside FIRMWARE_DIR. The file name is normalised to the
+    exact spelling artec_eplus48u.conf uses (Cygwin paths are case-sensitive)."""
+    canonical = {n.lower(): n for n in FIRMWARE_NAMES}[os.path.basename(src).lower()]
+    os.makedirs(FIRMWARE_DIR, exist_ok=True)
+    dst = os.path.join(FIRMWARE_DIR, canonical)
+    if os.path.abspath(src) != os.path.abspath(dst):
+        shutil.copyfile(src, dst)
+    home = os.path.join(FIRMWARE_HOME, canonical)
+    if os.path.abspath(src) != os.path.abspath(home):
+        try:
+            shutil.copyfile(src, home)
+        except OSError:
+            pass    # read-only install dir: still works for this session
+    return dst
+
+
+def firmware_ready():
+    """True if the firmware is where the backend expects it; copies it there
+    from FIRMWARE_HOME (the exe folder) first if needed."""
+    if find_firmware(FIRMWARE_DIR):
+        return True
+    src = find_firmware(FIRMWARE_HOME)
+    if src:
+        install_firmware(src)
+        return True
+    return False
+
+
 # ---------------- Geometry (pure functions, unit-testable without Tk) ----------------
 
 def clamp(v, lo, hi):
@@ -87,6 +239,20 @@ def area_args(sel_mm=None):
     left, top, width, height = sel_mm if sel_mm else (0.0, 0.0, BED_W_MM, BED_H_MM)
     return ["-l", f"{left:.1f}", "-t", f"{top:.1f}",
             "-x", f"{width:.1f}", "-y", f"{height:.1f}"]
+
+
+def scan_pixels(dpi, sel_mm=None):
+    _left, _top, width, height = sel_mm if sel_mm else (0.0, 0.0, BED_W_MM, BED_H_MM)
+    return round(width * dpi / 25.4) * round(height * dpi / 25.4)
+
+
+def scan_bytes(dpi, mode, sel_mm=None):
+    """Raw data the scanner has to send, before any file compression."""
+    return int(scan_pixels(dpi, sel_mm) * BYTES_PER_PIXEL[mode])
+
+
+def scan_timeout(dpi, mode, sel_mm=None):
+    return max(SCAN_TIMEOUT_MIN_S, scan_bytes(dpi, mode, sel_mm) // SCAN_MIN_BYTES_PER_S)
 
 
 def canvas_to_mm(cx, cy, disp):
@@ -158,10 +324,12 @@ def describe_sel(sel_mm):
 class ScannerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} {APP_VERSION} — SANE LM983x scanner")
+        self.title(f"{APP_NAME} {APP_VERSION} — SANE USB scanner")
         self.geometry("980x640")
         self.minsize(760, 480)
         self.busy = False
+        self.backend = DEFAULT_BACKEND   # SANE backend of the detected scanner
+        self.prompt_firmware = True      # False = never open the file dialog (tests)
         self.preview_img = None      # PIL image of the last full-bed preview
         self.tk_img = None           # keep a reference or Tk garbage-collects it
         self.disp = None             # (x0, y0, w, h) of the preview on the canvas
@@ -186,10 +354,12 @@ class ScannerApp(tk.Tk):
         ).pack(anchor="w", pady=(0, 8))
 
         ttk.Label(left, text="Resolution (DPI)").pack(anchor="w")
-        self.dpi_var = tk.StringVar(value="300")
-        ttk.Combobox(
-            left, textvariable=self.dpi_var, values=DPI_VALUES, state="readonly", width=18
-        ).pack(anchor="w", pady=(0, 8))
+        self.dpi_var = tk.StringVar(value=DEFAULT_DPI)
+        self.dpi_box = ttk.Combobox(
+            left, textvariable=self.dpi_var, values=BACKENDS[self.backend]["dpi"],
+            state="readonly", width=18,
+        )
+        self.dpi_box.pack(anchor="w", pady=(0, 8))
 
         ttk.Label(left, text="File format").pack(anchor="w")
         self.fmt_var = tk.StringVar(value="PNG")
@@ -197,7 +367,7 @@ class ScannerApp(tk.Tk):
             left, textvariable=self.fmt_var, values=FORMATS, state="readonly", width=18
         ).pack(anchor="w", pady=(0, 16))
 
-        self.btn_preview = ttk.Button(left, text="Preview (75 DPI)", command=self.do_preview)
+        self.btn_preview = ttk.Button(left, text=self._preview_label(), command=self.do_preview)
         self.btn_preview.pack(fill="x", pady=2)
         self.btn_scan = ttk.Button(left, text="SCAN", command=self.do_scan)
         self.btn_scan.pack(fill="x", pady=2)
@@ -222,8 +392,11 @@ class ScannerApp(tk.Tk):
         ttk.Button(left, text="Check scanner", command=lambda: self._start_bg(self.check_scanner)).pack(
             fill="x", pady=2
         )
+        self.scanner_var = tk.StringVar(value="")
+        ttk.Label(left, textvariable=self.scanner_var, wraplength=170,
+                  foreground="#555555").pack(anchor="w", pady=(10, 0))
         ttk.Label(left, text=f"v{APP_VERSION}", foreground="#999999").pack(
-            anchor="w", pady=(16, 0)
+            anchor="w", pady=(6, 0)
         )
 
         right = ttk.Frame(self, padding=8)
@@ -267,23 +440,92 @@ class ScannerApp(tk.Tk):
             self.busy = False
 
     # ---------------- Scanner ----------------
+    def _preview_label(self):
+        return f"Preview ({BACKENDS[self.backend]['preview_dpi']} DPI)"
+
+    def _apply_backend(self, backend, description, reported_dpis=None):
+        """Switch the UI to the detected backend (main thread)."""
+        self.backend = backend
+        dpis = reported_dpis or BACKENDS[backend]["dpi"]
+        self.dpi_box.configure(values=dpis)
+        if self.dpi_var.get() not in dpis:
+            self.dpi_var.set(DEFAULT_DPI if DEFAULT_DPI in dpis else dpis[len(dpis) // 2])
+        self.btn_preview.configure(text=self._preview_label())
+        # Shown on purpose: it tells whether the model's range was actually read.
+        if not BACKENDS[backend]["query_dpi"]:
+            limit = ""
+        elif reported_dpis:
+            limit = f" · up to {reported_dpis[-1]} DPI"
+        else:
+            limit = " · DPI range not reported"
+        self.scanner_var.set(f"{description}\n[{BACKENDS[backend]['chip']} · {backend}{limit}]")
+
     def check_scanner(self):
         self.set_status("Detecting scanner…", spinning=True)
         rc, out, err = run_scanimage(["-L"], timeout=120)
         txt = (out + err).decode(errors="replace")
-        if "plustek" in txt:
-            self.set_status("Scanner ready ✔")
-            return True
-        self.set_status(
-            "Scanner not detected: check the USB cable and the WinUSB driver (see README)."
-        )
-        return False
+        info = parse_device_list(txt)
+        if not info:
+            self.after(0, lambda: self.scanner_var.set(""))
+            self.set_status(
+                "Scanner not detected: check the USB cable and the WinUSB driver (see README)."
+            )
+            return False
+        backend, dev, desc = info
+        if backend not in BACKENDS:
+            self.set_status(f"Scanner found but its SANE backend '{backend}' is not "
+                            f"supported by this app.")
+            return False
+        reported = query_dpi_choices(backend, dev) if BACKENDS[backend]["query_dpi"] else None
+        self.after(0, self._apply_backend, backend, desc, reported)
+        if BACKENDS[backend]["firmware"] and not firmware_ready():
+            self.set_status(
+                f"{desc}: firmware file {FIRMWARE_NAMES[0]} missing — see README."
+            )
+            if self.prompt_firmware:
+                self.after(0, self._ask_firmware)
+            return False
+        self.set_status(f"Scanner ready ✔ — {desc}")
+        return True
 
-    def _scan_to_file(self, dpi, mode, fmt, win_path, sel_mm=None, timeout=900):
+    def _ask_firmware(self):
+        """Main thread: let the user locate the proprietary firmware once."""
+        messagebox.showinfo(
+            "Scanner firmware needed",
+            "This scanner (GT6816 chip) needs the firmware file from its original "
+            f"Windows driver: {FIRMWARE_NAMES[0]} (or {FIRMWARE_NAMES[1]} for the "
+            "E+ Pro / AstraSlim 1200 SE).\n\n"
+            "It is on the driver CD, or in C:\\Windows\\System32\\drivers of a PC "
+            "where the old driver was installed. See README for details.\n\n"
+            "Please select the file. It will be copied next to "
+            f"{APP_NAME}.exe and remembered.",
+        )
+        path = filedialog.askopenfilename(
+            title=f"Select {FIRMWARE_NAMES[0]}",
+            filetypes=[("Scanner firmware", "*.usb"), ("All files", "*.*")],
+        )
+        if not path:
+            self.set_status(f"No firmware selected — put {FIRMWARE_NAMES[0]} next to "
+                            f"{APP_NAME}.exe and click 'Check scanner'.")
+            return
+        if os.path.basename(path).lower() not in {n.lower() for n in FIRMWARE_NAMES}:
+            messagebox.showerror("Wrong file",
+                                 f"The firmware must be named {' or '.join(FIRMWARE_NAMES)}.")
+            return
+        install_firmware(path)
+        self._start_bg(self.check_scanner)
+
+    def _scan_to_file(self, dpi, mode, fmt, win_path, sel_mm=None, timeout=SCAN_TIMEOUT_MIN_S):
         args = ["--mode", mode, "--resolution", str(dpi)] + area_args(sel_mm) + [
             f"--format={fmt}", "-o", to_cygpath(win_path)
         ]
-        rc, out, err = run_scanimage(args, timeout=timeout)
+        try:
+            rc, out, err = run_scanimage(args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Scan stopped: no result after {timeout // 60} minutes. "
+                "Try a lower resolution or a smaller area."
+            ) from None
         ok = rc == 0 and os.path.exists(win_path) and os.path.getsize(win_path) > 0
         if not ok:
             output = (out + err).decode(errors="replace")
@@ -297,7 +539,7 @@ class ScannerApp(tk.Tk):
         # The preview is always the full bed: that is what you select an area on.
         self.set_status("Preview in progress…", spinning=True)
         tmp = os.path.join(os.environ.get("TEMP", APP_DIR), "canoscan_preview.png")
-        self._scan_to_file(75, "Color", "png", tmp)
+        self._scan_to_file(BACKENDS[self.backend]["preview_dpi"], "Color", "png", tmp)
         img = Image.open(tmp)
         img.load()
         self.set_status("Preview done ✔ — drag on the image to select an area")
@@ -307,7 +549,7 @@ class ScannerApp(tk.Tk):
         self._start_bg(self._scan_job)
 
     def _scan_job(self):
-        dpi = self.dpi_var.get()
+        dpi = int(self.dpi_var.get())
         mode = MODES[self.mode_var.get()]
         fmt = self.fmt_var.get().lower()
         sel = self.sel_mm
@@ -317,17 +559,23 @@ class ScannerApp(tk.Tk):
         path = os.path.join(SCAN_DIR, name)
 
         area = "full bed" if not sel else f"{sel[2]:.0f}x{sel[3]:.0f} mm"
-        self.set_status(f"Scanning {area} at {dpi} DPI… (may take minutes)", spinning=True)
-        self._scan_to_file(dpi, mode, fmt, path, sel_mm=sel)
+        raw_mb = scan_bytes(dpi, mode, sel) / 1_000_000
+        self.set_status(f"Scanning {area} at {dpi} DPI, about {raw_mb:.0f} MB of data… "
+                        "(may take minutes)", spinning=True)
+        self._scan_to_file(dpi, mode, fmt, path, sel_mm=sel,
+                           timeout=scan_timeout(dpi, mode, sel))
         self.set_status(f"Saved: {name} ✔")
 
-        if fmt == "png":
+        too_large = scan_pixels(dpi, sel) > MAX_ONSCREEN_PIXELS
+        if fmt == "png" and not too_large:
             self.after(0, lambda: self._show_result(path))
         else:
+            note = ("too large to display here" if too_large
+                    else "on-screen preview available for PNG only")
             self.after(0, self.canvas.delete, "all")
             self.after(0, lambda: self.canvas.create_text(
                 20, 20, anchor="nw", fill="#dddddd", font=("Segoe UI", 11),
-                text=f"File saved:\n{path}\n\n(on-screen preview available for PNG only)"
+                text=f"File saved:\n{path}\n\n({note})"
             ))
 
     def do_autocrop(self):
@@ -375,7 +623,7 @@ class ScannerApp(tk.Tk):
             self.disp = None
             self.canvas.create_text(
                 20, 20, anchor="nw", fill="#dddddd", font=("Segoe UI", 11),
-                text="No preview yet.\n\nClick \"Preview (75 DPI)\" to scan the whole bed,\n"
+                text="No preview yet.\n\nClick \"Preview\" to scan the whole bed,\n"
                      "then drag on the image to select the area to scan."
             )
             return

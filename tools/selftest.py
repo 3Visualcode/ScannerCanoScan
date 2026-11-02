@@ -11,14 +11,21 @@ plustek backend interprets -l/-t/-x/-y with the same origin we assume
 import os
 import sys
 
+# Status texts contain ✔/—; a cp1252 console must not abort the run.
+sys.stdout.reconfigure(errors="replace")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PIL import Image, ImageDraw
 
-from scanner_app import (BED_H_MM, BED_W_MM, area_args, autocrop_sel_mm,
-                         canvas_to_mm, describe_sel, mm_to_canvas,
-                         rect_to_sel_mm, to_cygpath)
-from tools.mock_scanimage import from_cygpath
+import scanner_app
+from scanner_app import (BACKENDS, BED_H_MM, BED_W_MM, FIRMWARE_NAMES, area_args,
+                         autocrop_sel_mm, canvas_to_mm, describe_sel,
+                         find_firmware, firmware_ready, install_firmware,
+                         mm_to_canvas, parse_device_list, parse_dpi_choices,
+                         rect_to_sel_mm, scan_bytes, scan_pixels, scan_timeout,
+                         to_cygpath)
+from tools.mock_scanimage import ALLOWED_DPI, DEVICES, HELP_RESOLUTION, from_cygpath
 
 FAILURES = []
 
@@ -132,9 +139,129 @@ def test_labels():
           describe_sel((10.0, 20.0, 100.0, 150.0)))
 
 
+def test_backends():
+    print("backend detection")
+    info = parse_device_list(DEVICES["plustek"])
+    check("plustek device line is parsed",
+          info is not None and info[0] == "plustek" and "N670U" in info[2], str(info))
+    info = parse_device_list(DEVICES["artec_eplus48u"])
+    check("artec_eplus48u device line is parsed",
+          info is not None and info[0] == "artec_eplus48u"
+          and info[2] == "Trust Easy Webscan 19200 flatbed scanner", str(info))
+    real = ("\ndevice `artec_eplus48u:libusb:001:007' is a Trust Easy Webscan 19200 "
+            "flatbed scanner\n")
+    check("real scanimage formatting (backticks, leading newline)",
+          parse_device_list(real) == ("artec_eplus48u", "libusb:001:007",
+                                      "Trust Easy Webscan 19200 flatbed scanner"))
+    check("no device -> None", parse_device_list("No scanners were identified.") is None)
+    check("a known backend wins over an unknown one",
+          parse_device_list("device `net:x' is a Foo\n" + DEVICES["plustek"])[0] == "plustek")
+    for name, prof in BACKENDS.items():
+        check(f"{name}: preview DPI is in its own DPI list",
+              str(prof["preview_dpi"]) in prof["dpi"])
+        check(f"{name}: default 300 DPI is available", "300" in prof["dpi"])
+    check("the mock artec help matches the app's fixed list",
+          parse_dpi_choices(HELP_RESOLUTION["artec_eplus48u"]) == BACKENDS["artec_eplus48u"]["dpi"])
+    check("mock and app agree on the artec DPI list",
+          [str(d) for d in ALLOWED_DPI["artec_eplus48u"]] == BACKENDS["artec_eplus48u"]["dpi"])
+    check("every mock device is a known backend",
+          all(parse_device_list(line)[0] in BACKENDS for line in DEVICES.values()))
+
+
+def test_dpi_choices():
+    print("resolution discovery")
+    cases = (
+        ("range up to 600", "    --resolution 50..600dpi [50]",
+         ["75", "150", "300", "600"]),
+        ("range up to 1200", "    --resolution 50..1200dpi [50]",
+         ["75", "150", "300", "600", "1200"]),
+        ("range up to 2400", "    --resolution 50..2400dpi [50]",
+         ["75", "150", "300", "600", "1200", "2400"]),
+        ("max between two steps", "    --resolution 50..800dpi [50]",
+         ["75", "150", "300", "600"]),
+        ("step 1 keeps every value", "    --resolution 50..600dpi (in steps of 1) [50]",
+         ["75", "150", "300", "600"]),
+        ("a step excludes values off the grid", "    --resolution 0..600dpi (in steps of 100) [50]",
+         ["300", "600"]),
+        ("fixed-point values", "    --resolution 50.00..1200.00dpi [50]",
+         ["75", "150", "300", "600", "1200"]),
+        ("word list is taken as is", "    --resolution 50|100|300|1200dpi [300]",
+         ["50", "100", "300", "1200"]),
+        ("automatic prefix", "    --resolution auto|75..600dpi [auto]",
+         ["75", "150", "300", "600"]),
+        ("inactive option is still parsed", "    --resolution 50..600dpi [inactive]",
+         ["75", "150", "300", "600"]),
+    )
+    for name, line, expected in cases:
+        got = parse_dpi_choices("Options specific to device:\n" + line + "\n")
+        check(name, got == expected, str(got))
+    check("generic scanimage usage has no choices",
+          parse_dpi_choices("Usage: scanimage [OPTION]...\n--mode something") is None)
+    check("garbage in the values is not fatal",
+          parse_dpi_choices("    --resolution a..bdpi [1]") is None)
+    check("a range with no usable step is unknown",
+          parse_dpi_choices("    --resolution 10..50dpi [10]") is None)
+
+
+def test_scan_size():
+    print("scan size and timeout")
+    check("1200 DPI full bed is about 142 Mpx",
+          142_000_000 < scan_pixels(1200) < 143_000_000, str(scan_pixels(1200)))
+    check("1200 DPI full-bed colour is about 430 MB",
+          420_000_000 < scan_bytes(1200, "Color") < 435_000_000, str(scan_bytes(1200, "Color")))
+    check("grey is a third of colour",
+          scan_bytes(600, "Gray") == scan_bytes(600, "Color") // 3)
+    check("short scans keep the minimum timeout",
+          scan_timeout(75, "Color") == scanner_app.SCAN_TIMEOUT_MIN_S)
+    check("1200 DPI full-bed colour gets over two hours",
+          scan_timeout(1200, "Color") > 2 * 3600, str(scan_timeout(1200, "Color")))
+    check("a small selection at 1200 DPI keeps the minimum timeout",
+          scan_timeout(1200, "Color", (0, 0, 30, 30)) == scanner_app.SCAN_TIMEOUT_MIN_S)
+    check("600 DPI full bed is still displayed on screen",
+          scan_pixels(600) <= scanner_app.MAX_ONSCREEN_PIXELS, str(scan_pixels(600)))
+    check("1200 DPI full bed is not loaded for display",
+          scan_pixels(1200) > scanner_app.MAX_ONSCREEN_PIXELS)
+
+
+def test_firmware():
+    print("firmware")
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="scc_fw_")
+    home = os.path.join(tmp, "home")
+    fwdir = os.path.join(tmp, "bundle", "artec_eplus48u")
+    os.makedirs(home)
+    saved = (scanner_app.FIRMWARE_HOME, scanner_app.FIRMWARE_DIR)
+    scanner_app.FIRMWARE_HOME, scanner_app.FIRMWARE_DIR = home, fwdir
+    try:
+        check("nothing found in an empty folder", find_firmware(home) is None)
+        check("missing folder is handled", find_firmware(os.path.join(tmp, "nope")) is None)
+        check("not ready without any file", firmware_ready() is False)
+        src = os.path.join(home, "artec48.USB")      # wrong case, as users type it
+        with open(src, "wb") as fh:
+            fh.write(b"\x00" * 8192)
+        check("firmware found case-insensitively", find_firmware(home) == src)
+        check("ready once the file is next to the exe", firmware_ready() is True)
+        dst = os.path.join(fwdir, FIRMWARE_NAMES[0])
+        check("copied into the backend folder with the exact conf spelling",
+              os.path.isfile(dst) and os.path.getsize(dst) == 8192, dst)
+        check("ready is idempotent", firmware_ready() is True)
+        elsewhere = os.path.join(tmp, "1200.usb")
+        with open(elsewhere, "wb") as fh:
+            fh.write(b"\x01" * 16)
+        out = install_firmware(elsewhere)
+        check("install from elsewhere lands in the backend folder",
+              out == os.path.join(fwdir, "1200.usb") and os.path.isfile(out))
+        check("...and is kept next to the exe", os.path.isfile(os.path.join(home, "1200.usb")))
+    finally:
+        scanner_app.FIRMWARE_HOME, scanner_app.FIRMWARE_DIR = saved
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for fn in (test_geometry, test_selection, test_area_args, test_autocrop,
-               test_paths, test_labels):
+               test_paths, test_labels, test_backends, test_dpi_choices,
+               test_scan_size, test_firmware):
         fn()
     print()
     if FAILURES:
